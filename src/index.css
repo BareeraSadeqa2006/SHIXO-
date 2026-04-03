@@ -1,0 +1,20 @@
+@import "tailwindcss";
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  background-color: #f4f6f8;
+  color: #1a202c;
+  font-size: 14px;
+}
+
+#root {
+  width: 100%;
+  min-height: 100vh;
+}
+
+.scrollbar-thin::-webkit-scrollbar { width: 6px; height: 6px; }
+.scrollbar-thin::-webkit-scrollbar-track { background: #f1f1f1; }
+.scrollbar-thin::-webkit-scrollbar-thumb { background: #097C87; border-radius: 3px; }
