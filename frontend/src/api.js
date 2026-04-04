@@ -1,6 +1,6 @@
 import axios from 'axios';
 
-const BASE = '/api';
+const BASE = 'https://shixo.onrender.com';
 
 export const getDashboardStats = () => axios.get(`${BASE}/dashboard_stats`).then(r => r.data);
 export const getTeachers = (search = '', page = 1, limit = 20) =>
