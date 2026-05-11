@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+
+# Build output
+frontend/dist/
+
+# Backend generated
+backend/shixo.db
+backend/models/
+backend/pdfs/
+backend/data/
+
+# OS
+.DS_Store
+*.swp
+
+# IDE
+.vscode/
+.idea/
+
+# Env
+.env
+.env.local

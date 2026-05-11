@@ -1,19 +1,26 @@
 """
-FastAPI Backend - AI Government Teacher Management Control Room
+SHIXO - AI-Powered Government Teacher Transfer & Workforce Management Platform
+FastAPI Backend
 """
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional, List
+import os
+import json
+import uuid
+import ast
+import hashlib
+from datetime import datetime
+
 import pandas as pd
 import numpy as np
 import joblib
-import json
-import os
-import ast
 
-app = FastAPI(title="Teacher Management Control Room API", version="1.0.0")
+from database import get_db, init_db, seed_db, DB_PATH, hash_password
 
+app = FastAPI(title="SHIXO API", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,431 +29,897 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Global state ────────────────────────────────────────────────────────────────
-teachers_df: pd.DataFrame = None
-schools_df: pd.DataFrame = None
+MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
+PDF_DIR = os.path.join(os.path.dirname(__file__), "pdfs")
 model = None
 le_subject = None
-feature_cols: list = None
+feature_cols = None
 
 
-def load_all():
-    global teachers_df, schools_df, model, le_subject, feature_cols
+# ── Pydantic Models ──────────────────────────────────────────────────────────
 
-    if not os.path.exists("data/teachers.csv"):
-        import generate_data
-        generate_data.generate_schools()  # regenerate
-        # run as script
-        import subprocess, sys
-        subprocess.run([sys.executable, "generate_data.py"], check=True)
+class LoginRequest(BaseModel):
+    user_id: str
+    password: str
+    role: str
 
-    if not os.path.exists("models/transfer_model.pkl"):
-        import subprocess, sys
-        subprocess.run([sys.executable, "train_model.py"], check=True)
+class PredictRequest(BaseModel):
+    teacher_id: str
 
-    teachers_df = pd.read_csv("data/teachers.csv")
-    schools_df = pd.read_csv("data/schools.csv")
-    model = joblib.load("models/transfer_model.pkl")
-    le_subject = joblib.load("models/label_encoder_subject.pkl")
-    feature_cols = joblib.load("models/feature_cols.pkl")
-    print("✅ Data and model loaded successfully")
+class ApplyTransferRequest(BaseModel):
+    teacher_id: str
+    requested_school: str
+    transfer_reason: str
 
+class ApproveTransferRequest(BaseModel):
+    request_id: str
+    meo_id: str
+
+class RejectTransferRequest(BaseModel):
+    request_id: str
+    meo_id: str
+    rejection_reason: str
+
+class RecommendSchoolRequest(BaseModel):
+    teacher_id: str
+
+
+# ── Startup ──────────────────────────────────────────────────────────────────
 
 @app.on_event("startup")
 def startup():
-    load_all()
+    global model, le_subject, feature_cols
+    init_db()
+    seed_db()
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    os.makedirs(PDF_DIR, exist_ok=True)
+
+    model_path = os.path.join(MODEL_DIR, "transfer_model.pkl")
+    if not os.path.exists(model_path):
+        train_model_from_db()
+
+    if os.path.exists(model_path):
+        model = joblib.load(model_path)
+        le_subject = joblib.load(os.path.join(MODEL_DIR, "label_encoder_subject.pkl"))
+        feature_cols = joblib.load(os.path.join(MODEL_DIR, "feature_cols.pkl"))
 
 
-def reload_data():
-    global teachers_df, schools_df
-    teachers_df = pd.read_csv("data/teachers.csv")
-    schools_df = pd.read_csv("data/schools.csv")
+def train_model_from_db():
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.model_selection import train_test_split
+    from sklearn.preprocessing import LabelEncoder
+    from sklearn.metrics import accuracy_score, confusion_matrix
+
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM teachers").fetchall()
+    conn.close()
+
+    data = []
+    for r in rows:
+        score = compute_priority(dict(r))
+        recommended = 1 if score >= 45 else 0
+        data.append({
+            "years_of_service": r["years_of_service"],
+            "rural_service_years": r["rural_service_years"],
+            "transfer_request": r["transfer_request"],
+            "medical_condition": r["medical_condition"],
+            "spouse_distance": r["spouse_distance"],
+            "promotion_due": r["promotion_due"],
+            "subject": r["subject"],
+            "recommended": recommended
+        })
+
+    df = pd.DataFrame(data)
+    le = LabelEncoder()
+    df["subject_encoded"] = le.fit_transform(df["subject"])
+
+    cols = [
+        "years_of_service", "rural_service_years", "transfer_request",
+        "medical_condition", "spouse_distance", "promotion_due", "subject_encoded"
+    ]
+
+    X = df[cols]
+    y = df["recommended"]
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    clf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+    clf.fit(X_train, y_train)
+
+    y_pred = clf.predict(X_test)
+    acc = accuracy_score(y_test, y_pred)
+    cm = confusion_matrix(y_test, y_pred)
+
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    joblib.dump(clf, os.path.join(MODEL_DIR, "transfer_model.pkl"))
+    joblib.dump(le, os.path.join(MODEL_DIR, "label_encoder_subject.pkl"))
+    joblib.dump(cols, os.path.join(MODEL_DIR, "feature_cols.pkl"))
+
+    metrics = {
+        "accuracy": round(acc * 100, 2),
+        "confusion_matrix": cm.tolist(),
+        "feature_importance": dict(zip(cols, clf.feature_importances_.tolist()))
+    }
+    with open(os.path.join(MODEL_DIR, "metrics.json"), "w") as f:
+        json.dump(metrics, f)
+
+    print(f"Model trained. Accuracy: {acc*100:.2f}%")
 
 
-# ── Models ───────────────────────────────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
-class TransferPredictRequest(BaseModel):
-    teacher_id: str
-
-class SchoolRecommendRequest(BaseModel):
-    teacher_id: str
-
-class TransferExecuteRequest(BaseModel):
-    teacher_id: str
-    target_school_id: str
-
-
-# ── Helpers ──────────────────────────────────────────────────────────────────────
-
-def compute_priority_score(row) -> float:
+def compute_priority(row: dict) -> float:
     score = 0
-    if row.get("Transfer_Request", 0) == 1: score += 30
-    if row.get("Years_in_Current_School", 0) >= 5: score += 20
-    if row.get("Rural_Service_Years", 0) >= 3: score += 15
-    if row.get("Medical_Ground", 0) == 1: score += 25
-    if row.get("Spouse_Location_Distance", 0) > 200: score += 20
-    if row.get("Promotion_Due", 0) == 1: score += 10
-    if row.get("Years_of_Service", 0) >= 10: score += 10
+    if row.get("transfer_request", 0) == 1:
+        score += 30
+    if row.get("medical_condition", 0) == 1:
+        score += 25
+    if row.get("years_of_service", 0) >= 5:
+        score += 20
+    if row.get("rural_service_years", 0) >= 3:
+        score += 15
+    if row.get("promotion_due", 0) == 1:
+        score += 10
+    if row.get("years_of_service", 0) >= 10:
+        score += 10
+    if row.get("spouse_distance", 0) > 200:
+        score += 20
     return min(score, 100)
 
 
-def get_transfer_reasons(row) -> List[str]:
+def get_transfer_reasons(row: dict) -> list:
     reasons = []
-    if row.get("Transfer_Request", 0) == 1:
-        reasons.append("Teacher has submitted a transfer request")
-    if row.get("Years_in_Current_School", 0) >= 5:
-        reasons.append(f"Served {row['Years_in_Current_School']} years in current school (≥5 years policy)")
-    if row.get("Rural_Service_Years", 0) >= 3:
-        reasons.append(f"Completed {row['Rural_Service_Years']} years of rural service")
-    if row.get("Medical_Ground", 0) == 1:
-        reasons.append("Medical ground transfer requested")
-    if row.get("Spouse_Location_Distance", 0) > 200:
-        reasons.append(f"Spouse located {row['Spouse_Location_Distance']} km away")
-    if row.get("Promotion_Due", 0) == 1:
-        reasons.append("Promotion due – eligible for upgraded posting")
+    if row.get("transfer_request", 0) == 1:
+        reasons.append("Teacher has submitted a formal transfer request")
+    if row.get("medical_condition", 0) == 1:
+        reasons.append("Medical condition requires transfer consideration")
+    if row.get("years_of_service", 0) >= 5:
+        reasons.append(f"Completed {row['years_of_service']} years of service (≥5 years)")
+    if row.get("rural_service_years", 0) >= 3:
+        reasons.append(f"Completed {row['rural_service_years']} years of rural service")
+    if row.get("promotion_due", 0) == 1:
+        reasons.append("Promotion due — eligible for upgraded posting")
+    if row.get("spouse_distance", 0) > 200:
+        reasons.append(f"Spouse located {row['spouse_distance']} km away")
     if not reasons:
-        reasons.append("Routine transfer cycle")
+        reasons.append("Routine transfer cycle review")
     return reasons
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────────
-
-@app.get("/dashboard_stats")
-def dashboard_stats():
-    reload_data()
-    total_teachers = len(teachers_df)
-    total_schools = len(schools_df)
-    transfers_recommended = int(teachers_df["Transfer_Recommended"].sum())
-
-    schools_df["Surplus"] = schools_df["Current_Teacher_Count"] - schools_df["Required_Teacher_Count"]
-    surplus_schools = int((schools_df["Surplus"] > 0).sum())
-    shortage_schools = int((schools_df["Surplus"] < 0).sum())
-    avg_ratio = round(float(schools_df["Student_Teacher_Ratio"].mean()), 2)
-
-    # Top 10 schools by student strength
-    top_schools = schools_df.nlargest(10, "Student_Strength")[
-        ["School_Name", "District", "Student_Strength",
-         "Current_Teacher_Count", "Required_Teacher_Count", "Student_Teacher_Ratio"]
-    ].to_dict(orient="records")
-
-    # District-wise teacher distribution
-    district_counts = {}
-    for _, row in schools_df.iterrows():
-        d = row["District"]
-        district_counts[d] = district_counts.get(d, 0) + row["Current_Teacher_Count"]
-    district_data = [{"district": k, "teachers": int(v)} for k, v in
-                     sorted(district_counts.items(), key=lambda x: -x[1])[:15]]
-
-    # Ratio distribution buckets
-    bins = [0, 20, 30, 40, 50, 200]
-    labels = ["<20", "20-30", "30-40", "40-50", ">50"]
-    schools_df["Ratio_Bucket"] = pd.cut(schools_df["Student_Teacher_Ratio"], bins=bins, labels=labels)
-    ratio_dist = schools_df["Ratio_Bucket"].value_counts().sort_index()
-    ratio_data = [{"range": str(k), "schools": int(v)} for k, v in ratio_dist.items()]
-
-    # Subject distribution
-    subj_counts = teachers_df["Subject"].value_counts().head(10)
-    subject_data = [{"subject": k, "count": int(v)} for k, v in subj_counts.items()]
-
-    # Model metrics
-    metrics = {}
-    if os.path.exists("models/metrics.json"):
-        with open("models/metrics.json") as f:
-            metrics = json.load(f)
-
-    return {
-        "total_teachers": total_teachers,
-        "total_schools": total_schools,
-        "transfers_recommended": transfers_recommended,
-        "surplus_schools": surplus_schools,
-        "shortage_schools": shortage_schools,
-        "avg_student_teacher_ratio": avg_ratio,
-        "top_schools": top_schools,
-        "district_data": district_data,
-        "ratio_data": ratio_data,
-        "subject_data": subject_data,
-        "model_accuracy": metrics.get("accuracy", 0),
-    }
+def add_notification(teacher_id: str, message: str, ntype: str = "info"):
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO notifications (teacher_id, message, type) VALUES (?, ?, ?)",
+        (teacher_id, message, ntype)
+    )
+    conn.commit()
+    conn.close()
 
 
-@app.get("/teachers")
-def get_teachers(search: str = "", page: int = 1, limit: int = 20):
-    reload_data()
-    df = teachers_df.copy()
-    if search:
-        mask = (
-            df["Teacher_Name"].str.contains(search, case=False, na=False) |
-            df["Teacher_ID"].str.contains(search, case=False, na=False) |
-            df["Subject"].str.contains(search, case=False, na=False) |
-            df["Current_School_Name"].str.contains(search, case=False, na=False)
-        )
-        df = df[mask]
-    total = len(df)
-    start = (page - 1) * limit
-    end = start + limit
-    records = df.iloc[start:end].to_dict(orient="records")
-    return {"total": total, "page": page, "limit": limit, "teachers": records}
+def generate_transfer_pdf(request_id: str) -> str:
+    conn = get_db()
+    req = conn.execute(
+        "SELECT * FROM transfer_requests WHERE request_id = ?", (request_id,)
+    ).fetchone()
+    if not req:
+        conn.close()
+        return ""
+
+    teacher = conn.execute(
+        "SELECT * FROM teachers WHERE teacher_id = ?", (req["teacher_id"],)
+    ).fetchone()
+
+    old_school = conn.execute(
+        "SELECT * FROM schools WHERE school_id = ?", (req["current_school"],)
+    ).fetchone()
+
+    new_school = conn.execute(
+        "SELECT * FROM schools WHERE school_id = ?", (req["requested_school"],)
+    ).fetchone()
+    conn.close()
+
+    if not teacher or not old_school or not new_school:
+        return ""
+
+    pdf_filename = f"transfer_order_{request_id}.txt"
+    pdf_path = os.path.join(PDF_DIR, pdf_filename)
+
+    now = datetime.now().strftime("%d-%m-%Y")
+    content = f"""
+================================================================================
+                    GOVERNMENT OF TELANGANA
+              DEPARTMENT OF SCHOOL EDUCATION
+                  TRANSFER ORDER
+================================================================================
+
+Order No: SHIXO/TO/{request_id}
+Date: {now}
+
+TRANSFER ORDER
+
+This is to certify that the following transfer has been approved under the
+Government Teacher Transfer Management System (SHIXO).
+
+TEACHER DETAILS:
+─────────────────────────────────────────────────────────
+Name            : {teacher['name']}
+Teacher ID      : {teacher['teacher_id']}
+Subject         : {teacher['subject']}
+Gender          : {teacher['gender']}
+Years of Service: {teacher['years_of_service']}
+
+TRANSFER DETAILS:
+─────────────────────────────────────────────────────────
+From School     : {old_school['school_name']}
+                  Mandal: {old_school['mandal']}
+                  District: {old_school['district']}
+
+To School       : {new_school['school_name']}
+                  Mandal: {new_school['mandal']}
+                  District: {new_school['district']}
+
+Transfer Reason : {req['transfer_reason']}
+Priority Score  : {req['priority_score']}
+Request Date    : {req['request_date']}
+Approval Date   : {req['approval_date']}
+
+APPROVED BY:
+─────────────────────────────────────────────────────────
+MEO ID          : {req['assigned_meo']}
+Status          : APPROVED
+
+This order is generated electronically through the SHIXO platform.
+No physical signature is required.
+
+─────────────────────────────────────────────────────────
+                    [OFFICIAL SEAL]
+          Mandal Education Officer
+          Department of School Education
+          Government of Telangana
+================================================================================
+"""
+    with open(pdf_path, "w") as f:
+        f.write(content)
+
+    conn2 = get_db()
+    conn2.execute(
+        "UPDATE transfer_requests SET generated_pdf_path = ? WHERE request_id = ?",
+        (pdf_path, request_id)
+    )
+    conn2.commit()
+    conn2.close()
+
+    return pdf_path
 
 
-@app.get("/schools")
-def get_schools(search: str = "", page: int = 1, limit: int = 20):
-    reload_data()
-    df = schools_df.copy()
-    df["Surplus_Shortage"] = df["Current_Teacher_Count"] - df["Required_Teacher_Count"]
-    if search:
-        mask = (
-            df["School_Name"].str.contains(search, case=False, na=False) |
-            df["District"].str.contains(search, case=False, na=False)
-        )
-        df = df[mask]
-    total = len(df)
-    start = (page - 1) * limit
-    end = start + limit
-    records = df.iloc[start:end].to_dict(orient="records")
-    return {"total": total, "page": page, "limit": limit, "schools": records}
+# ── Auth Endpoints ───────────────────────────────────────────────────────────
+
+@app.post("/login")
+def login(req: LoginRequest):
+    conn = get_db()
+    hashed = hash_password(req.password)
+
+    if req.role == "teacher":
+        user = conn.execute(
+            "SELECT * FROM teachers WHERE teacher_id = ? AND password = ?",
+            (req.user_id, hashed)
+        ).fetchone()
+        if not user:
+            conn.close()
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        conn.close()
+        return {
+            "success": True,
+            "role": "teacher",
+            "user_id": user["teacher_id"],
+            "name": user["name"],
+            "mandal": user["mandal"],
+        }
+    elif req.role == "meo":
+        user = conn.execute(
+            "SELECT * FROM meos WHERE meo_id = ? AND password = ?",
+            (req.user_id, hashed)
+        ).fetchone()
+        if not user:
+            conn.close()
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        conn.close()
+        return {
+            "success": True,
+            "role": "meo",
+            "user_id": user["meo_id"],
+            "name": user["name"],
+            "assigned_mandal": user["assigned_mandal"],
+        }
+    else:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Invalid role")
+
+
+# ── Teacher Endpoints ────────────────────────────────────────────────────────
+
+@app.get("/teacher/{teacher_id}")
+def get_teacher_profile(teacher_id: str):
+    conn = get_db()
+    teacher = conn.execute(
+        "SELECT * FROM teachers WHERE teacher_id = ?", (teacher_id,)
+    ).fetchone()
+    if not teacher:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Teacher not found")
+
+    school = conn.execute(
+        "SELECT * FROM schools WHERE school_id = ?", (teacher["current_school"],)
+    ).fetchone()
+    conn.close()
+
+    t = dict(teacher)
+    del t["password"]
+    t["school_name"] = school["school_name"] if school else "N/A"
+    t["school_district"] = school["district"] if school else "N/A"
+    t["school_student_strength"] = school["student_strength"] if school else 0
+    t["school_teacher_count"] = school["current_teacher_count"] if school else 0
+    return t
 
 
 @app.post("/predict_transfer")
-def predict_transfer(req: TransferPredictRequest):
-    reload_data()
-    row = teachers_df[teachers_df["Teacher_ID"] == req.teacher_id]
-    if row.empty:
+def predict_transfer(req: PredictRequest):
+    conn = get_db()
+    teacher = conn.execute(
+        "SELECT * FROM teachers WHERE teacher_id = ?", (req.teacher_id,)
+    ).fetchone()
+    if not teacher:
+        conn.close()
         raise HTTPException(status_code=404, detail="Teacher not found")
+    conn.close()
 
-    r = row.iloc[0]
+    t = dict(teacher)
+    priority = compute_priority(t)
+    reasons = get_transfer_reasons(t)
 
-    # Encode subject
-    try:
-        subject_enc = le_subject.transform([r["Subject"]])[0]
-    except Exception:
-        subject_enc = 0
+    prediction = False
+    confidence = 0.0
 
-    feat_map = {
-        "Age": r["Age"],
-        "Years_of_Service": r["Years_of_Service"],
-        "Years_in_Current_School": r["Years_in_Current_School"],
-        "Rural_Service_Years": r["Rural_Service_Years"],
-        "Transfer_Request": r["Transfer_Request"],
-        "Medical_Ground": r["Medical_Ground"],
-        "Spouse_Location_Distance": r["Spouse_Location_Distance"],
-        "Promotion_Due": r["Promotion_Due"],
-        "Subject_Encoded": subject_enc,
-    }
+    if model and le_subject and feature_cols:
+        try:
+            subj_enc = le_subject.transform([t["subject"]])[0]
+        except Exception:
+            subj_enc = 0
 
-    X = pd.DataFrame([[feat_map[c] for c in feature_cols]], columns=feature_cols)
-    prediction = int(model.predict(X)[0])
-    proba = model.predict_proba(X)[0]
-    confidence = round(float(proba[prediction]) * 100, 1)
-
-    priority = compute_priority_score(r.to_dict())
-    reasons = get_transfer_reasons(r.to_dict())
+        feat_map = {
+            "years_of_service": t["years_of_service"],
+            "rural_service_years": t["rural_service_years"],
+            "transfer_request": t["transfer_request"],
+            "medical_condition": t["medical_condition"],
+            "spouse_distance": t["spouse_distance"],
+            "promotion_due": t["promotion_due"],
+            "subject_encoded": subj_enc,
+        }
+        X = pd.DataFrame([[feat_map.get(c, 0) for c in feature_cols]], columns=feature_cols)
+        pred = int(model.predict(X)[0])
+        proba = model.predict_proba(X)[0]
+        prediction = bool(pred)
+        confidence = round(float(proba[pred]) * 100, 1)
+    else:
+        prediction = priority >= 45
+        confidence = min(priority + 20, 95)
 
     return {
         "teacher_id": req.teacher_id,
-        "teacher_name": r["Teacher_Name"],
-        "subject": r["Subject"],
-        "current_school": r["Current_School_Name"],
-        "transfer_recommended": bool(prediction),
+        "name": t["name"],
+        "subject": t["subject"],
+        "transfer_recommended": prediction,
         "confidence": confidence,
         "priority_score": priority,
         "reasons": reasons,
-        "teacher_details": {
-            "age": int(r["Age"]),
-            "years_of_service": int(r["Years_of_Service"]),
-            "years_in_school": int(r["Years_in_Current_School"]),
-            "rural_years": int(r["Rural_Service_Years"]),
-            "transfer_request": bool(r["Transfer_Request"]),
-            "medical_ground": bool(r["Medical_Ground"]),
-            "spouse_distance": int(r["Spouse_Location_Distance"]),
-            "promotion_due": bool(r["Promotion_Due"]),
+        "details": {
+            "years_of_service": t["years_of_service"],
+            "rural_service_years": t["rural_service_years"],
+            "transfer_request": t["transfer_request"],
+            "medical_condition": t["medical_condition"],
+            "spouse_distance": t["spouse_distance"],
+            "promotion_due": t["promotion_due"],
         }
     }
 
 
 @app.post("/recommend_school")
-def recommend_school(req: SchoolRecommendRequest):
-    reload_data()
-    teacher = teachers_df[teachers_df["Teacher_ID"] == req.teacher_id]
-    if teacher.empty:
+def recommend_school(req: RecommendSchoolRequest):
+    conn = get_db()
+    teacher = conn.execute(
+        "SELECT * FROM teachers WHERE teacher_id = ?", (req.teacher_id,)
+    ).fetchone()
+    if not teacher:
+        conn.close()
         raise HTTPException(status_code=404, detail="Teacher not found")
 
-    t = teacher.iloc[0]
-    subject = t["Subject"]
-    current_school_id = t["Current_School_ID"]
+    t = dict(teacher)
+    subject = t["subject"]
+    current_school = t["current_school"]
 
-    df = schools_df.copy()
-    # Exclude current school
-    df = df[df["School_ID"] != current_school_id]
+    schools = conn.execute(
+        "SELECT * FROM schools WHERE school_id != ?", (current_school,)
+    ).fetchall()
+    conn.close()
 
-    # Compute shortage
-    df["Shortage"] = df["Required_Teacher_Count"] - df["Current_Teacher_Count"]
-    # Only schools with shortage or vacancy for subject
-    df = df[df["Shortage"] >= 0]  # exclude surplus
+    results = []
+    for s in schools:
+        sd = dict(s)
+        shortage = sd["required_teacher_count"] - sd["current_teacher_count"]
+        if shortage < 0:
+            continue
 
-    def subject_vacancy(vacancy_str, subj):
+        subj_vacancy = 0
         try:
-            d = ast.literal_eval(str(vacancy_str))
-            return d.get(subj, 0)
+            vac = json.loads(sd["subject_wise_vacancy"])
+            subj_vacancy = vac.get(subject, 0)
         except Exception:
-            return 0
+            pass
 
-    df["Subject_Vacancy"] = df["Subject_Wise_Vacancy"].apply(
-        lambda x: subject_vacancy(x, subject)
-    )
+        score = shortage * 2 + subj_vacancy * 5 - sd["student_teacher_ratio"] * 0.1
+        sd["shortage"] = shortage
+        sd["subject_vacancy"] = subj_vacancy
+        sd["allocation_score"] = round(score, 2)
+        results.append(sd)
 
-    # Score: higher shortage + subject vacancy + lower ratio = better
-    df["Score"] = (
-        df["Shortage"] * 2 +
-        df["Subject_Vacancy"] * 5 -
-        df["Student_Teacher_Ratio"] * 0.1
-    )
-
-    top3 = df.nlargest(3, "Score")[
-        ["School_ID", "School_Name", "District", "Student_Strength",
-         "Current_Teacher_Count", "Required_Teacher_Count",
-         "Student_Teacher_Ratio", "Subject_Vacancy", "Shortage", "Score"]
-    ].to_dict(orient="records")
-
-    for s in top3:
-        s["Score"] = round(float(s["Score"]), 2)
-        s["Student_Teacher_Ratio"] = round(float(s["Student_Teacher_Ratio"]), 2)
+    results.sort(key=lambda x: x["allocation_score"], reverse=True)
+    top = results[:5]
 
     return {
         "teacher_id": req.teacher_id,
-        "teacher_name": t["Teacher_Name"],
+        "name": t["name"],
         "subject": subject,
-        "recommended_schools": top3
+        "recommended_schools": top
     }
 
 
-@app.post("/execute_transfer")
-def execute_transfer(req: TransferExecuteRequest):
-    global teachers_df, schools_df
-    reload_data()
-
-    teacher_idx = teachers_df[teachers_df["Teacher_ID"] == req.teacher_id].index
-    if teacher_idx.empty:
+@app.post("/apply_transfer")
+def apply_transfer(req: ApplyTransferRequest):
+    conn = get_db()
+    teacher = conn.execute(
+        "SELECT * FROM teachers WHERE teacher_id = ?", (req.teacher_id,)
+    ).fetchone()
+    if not teacher:
+        conn.close()
         raise HTTPException(status_code=404, detail="Teacher not found")
 
-    school_idx = schools_df[schools_df["School_ID"] == req.target_school_id].index
-    if school_idx.empty:
-        raise HTTPException(status_code=404, detail="Target school not found")
+    existing = conn.execute(
+        "SELECT * FROM transfer_requests WHERE teacher_id = ? AND status = 'Pending'",
+        (req.teacher_id,)
+    ).fetchone()
+    if existing:
+        conn.close()
+        raise HTTPException(status_code=400, detail="You already have a pending transfer request")
 
-    t = teachers_df.loc[teacher_idx[0]]
-    old_school_id = t["Current_School_ID"]
-    old_idx = schools_df[schools_df["School_ID"] == old_school_id].index
+    school = conn.execute(
+        "SELECT * FROM schools WHERE school_id = ?", (req.requested_school,)
+    ).fetchone()
+    if not school:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Requested school not found")
 
-    # Decrease old school count
-    if not old_idx.empty:
-        schools_df.loc[old_idx[0], "Current_Teacher_Count"] = max(
-            0, schools_df.loc[old_idx[0], "Current_Teacher_Count"] - 1
-        )
-        ss = schools_df.loc[old_idx[0], "Student_Strength"]
-        ct = schools_df.loc[old_idx[0], "Current_Teacher_Count"]
-        schools_df.loc[old_idx[0], "Student_Teacher_Ratio"] = round(ss / max(ct, 1), 2)
+    t = dict(teacher)
+    priority = compute_priority(t)
+    request_id = f"REQ{uuid.uuid4().hex[:8].upper()}"
+    now = datetime.now().strftime("%Y-%m-%d")
 
-    # Increase new school count
-    schools_df.loc[school_idx[0], "Current_Teacher_Count"] += 1
-    ss = schools_df.loc[school_idx[0], "Student_Strength"]
-    ct = schools_df.loc[school_idx[0], "Current_Teacher_Count"]
-    schools_df.loc[school_idx[0], "Student_Teacher_Ratio"] = round(ss / max(ct, 1), 2)
+    conn.execute(
+        """INSERT INTO transfer_requests
+        (request_id, teacher_id, current_school, requested_school, mandal,
+         request_date, transfer_reason, priority_score, status, assigned_meo)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Pending', ?)""",
+        (request_id, req.teacher_id, t["current_school"], req.requested_school,
+         t["mandal"], now, req.transfer_reason, priority, t["assigned_meo"])
+    )
 
-    # Update teacher record
-    new_school_name = schools_df.loc[school_idx[0], "School_Name"]
-    teachers_df.loc[teacher_idx[0], "Current_School_ID"] = req.target_school_id
-    teachers_df.loc[teacher_idx[0], "Current_School_Name"] = new_school_name
-    teachers_df.loc[teacher_idx[0], "Years_in_Current_School"] = 0
-    teachers_df.loc[teacher_idx[0], "Transfer_Recommended"] = 0
-    teachers_df.loc[teacher_idx[0], "Transfer_Request"] = 0
+    conn.execute(
+        "UPDATE teachers SET transfer_status = 'Pending', requested_school = ? WHERE teacher_id = ?",
+        (req.requested_school, req.teacher_id)
+    )
+    conn.commit()
+    conn.close()
 
-    # Save updated data
-    teachers_df.to_csv("data/teachers.csv", index=False)
-    schools_df.to_csv("data/schools.csv", index=False)
+    add_notification(
+        req.teacher_id,
+        f"Your transfer request ({request_id}) has been submitted and is pending review.",
+        "info"
+    )
 
     return {
         "success": True,
-        "message": f"Teacher {req.teacher_id} transferred to {new_school_name}",
-        "teacher_id": req.teacher_id,
-        "new_school": new_school_name,
-        "new_school_id": req.target_school_id,
+        "request_id": request_id,
+        "message": "Transfer request submitted successfully"
     }
 
 
-@app.get("/workforce_data")
-def workforce_data():
-    reload_data()
-    df = schools_df.copy()
-    df["Surplus_Shortage"] = df["Current_Teacher_Count"] - df["Required_Teacher_Count"]
+@app.get("/transfer_history/{teacher_id}")
+def transfer_history(teacher_id: str):
+    conn = get_db()
+    requests = conn.execute(
+        "SELECT * FROM transfer_requests WHERE teacher_id = ? ORDER BY request_date DESC",
+        (teacher_id,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in requests]
 
-    # District summary
-    district_summary = df.groupby("District").agg(
-        Schools=("School_ID", "count"),
-        Total_Teachers=("Current_Teacher_Count", "sum"),
-        Required_Teachers=("Required_Teacher_Count", "sum"),
-        Avg_Ratio=("Student_Teacher_Ratio", "mean"),
-        Surplus_Schools=(
-            "Surplus_Shortage", lambda x: int((x > 0).sum())
-        ),
-        Shortage_Schools=(
-            "Surplus_Shortage", lambda x: int((x < 0).sum())
-        ),
-    ).reset_index()
-    district_summary["Avg_Ratio"] = district_summary["Avg_Ratio"].round(2)
-    district_summary["Gap"] = (
-        district_summary["Required_Teachers"] - district_summary["Total_Teachers"]
-    ).astype(int)
 
-    # Surplus/shortage schools
-    surplus = df[df["Surplus_Shortage"] > 0].nlargest(10, "Surplus_Shortage")[
-        ["School_Name", "District", "Current_Teacher_Count",
-         "Required_Teacher_Count", "Surplus_Shortage"]
-    ].to_dict(orient="records")
+@app.get("/notifications/{teacher_id}")
+def get_notifications(teacher_id: str):
+    conn = get_db()
+    notifs = conn.execute(
+        "SELECT * FROM notifications WHERE teacher_id = ? ORDER BY created_at DESC",
+        (teacher_id,)
+    ).fetchall()
+    conn.close()
+    return [dict(n) for n in notifs]
 
-    shortage = df[df["Surplus_Shortage"] < 0].nsmallest(10, "Surplus_Shortage")[
-        ["School_Name", "District", "Current_Teacher_Count",
-         "Required_Teacher_Count", "Surplus_Shortage"]
-    ].to_dict(orient="records")
 
-    # Subject-wise teacher count
-    subj_counts = teachers_df["Subject"].value_counts().reset_index()
-    subj_counts.columns = ["subject", "count"]
-    subject_dist = subj_counts.to_dict(orient="records")
+@app.put("/notifications/{notification_id}/read")
+def mark_notification_read(notification_id: int):
+    conn = get_db()
+    conn.execute("UPDATE notifications SET read = 1 WHERE id = ?", (notification_id,))
+    conn.commit()
+    conn.close()
+    return {"success": True}
 
-    # Age distribution
-    bins = [20, 30, 40, 50, 65]
-    labels = ["20-30", "30-40", "40-50", "50-65"]
-    age_series = pd.cut(teachers_df["Age"], bins=bins, labels=labels)
-    age_dist = age_series.value_counts().sort_index()
-    age_data = [{"range": str(k), "count": int(v)} for k, v in age_dist.items()]
 
-    # Service year distribution
-    srv_bins = [0, 5, 10, 15, 20, 40]
-    srv_labels = ["0-5", "5-10", "10-15", "15-20", "20+"]
-    srv_series = pd.cut(teachers_df["Years_of_Service"], bins=srv_bins, labels=srv_labels)
-    srv_dist = srv_series.value_counts().sort_index()
-    srv_data = [{"range": str(k), "count": int(v)} for k, v in srv_dist.items()]
+# ── MEO Endpoints ────────────────────────────────────────────────────────────
+
+@app.get("/meo/{meo_id}/dashboard")
+def meo_dashboard(meo_id: str):
+    conn = get_db()
+    meo = conn.execute("SELECT * FROM meos WHERE meo_id = ?", (meo_id,)).fetchone()
+    if not meo:
+        conn.close()
+        raise HTTPException(status_code=404, detail="MEO not found")
+
+    mandal = meo["assigned_mandal"]
+
+    schools = conn.execute(
+        "SELECT * FROM schools WHERE mandal = ?", (mandal,)
+    ).fetchall()
+
+    teachers = conn.execute(
+        "SELECT * FROM teachers WHERE mandal = ?", (mandal,)
+    ).fetchall()
+
+    pending = conn.execute(
+        "SELECT * FROM transfer_requests WHERE mandal = ? AND status = 'Pending' ORDER BY priority_score DESC",
+        (mandal,)
+    ).fetchall()
+
+    approved = conn.execute(
+        "SELECT * FROM transfer_requests WHERE mandal = ? AND status = 'Approved' ORDER BY approval_date DESC",
+        (mandal,)
+    ).fetchall()
+
+    rejected = conn.execute(
+        "SELECT * FROM transfer_requests WHERE mandal = ? AND status = 'Rejected' ORDER BY approval_date DESC",
+        (mandal,)
+    ).fetchall()
+    conn.close()
+
+    schools_list = [dict(s) for s in schools]
+    teachers_list = [dict(t) for t in teachers]
+
+    total_teachers = len(teachers_list)
+    total_schools = len(schools_list)
+    shortage_schools = sum(1 for s in schools_list if s["current_teacher_count"] < s["required_teacher_count"])
+    surplus_schools = sum(1 for s in schools_list if s["current_teacher_count"] > s["required_teacher_count"])
+
+    subject_dist = {}
+    for t in teachers_list:
+        subject_dist[t["subject"]] = subject_dist.get(t["subject"], 0) + 1
+
+    avg_ratio = round(
+        sum(s["student_teacher_ratio"] for s in schools_list) / max(len(schools_list), 1), 2
+    )
 
     return {
-        "district_summary": district_summary.to_dict(orient="records"),
-        "surplus_schools": surplus,
-        "shortage_schools": shortage,
+        "meo_name": meo["name"],
+        "mandal": mandal,
+        "total_teachers": total_teachers,
+        "total_schools": total_schools,
+        "shortage_schools": shortage_schools,
+        "surplus_schools": surplus_schools,
+        "avg_student_teacher_ratio": avg_ratio,
+        "pending_requests": [dict(r) for r in pending],
+        "approved_requests": [dict(r) for r in approved],
+        "rejected_requests": [dict(r) for r in rejected],
         "subject_distribution": subject_dist,
-        "age_distribution": age_data,
-        "service_distribution": srv_data,
-        "total_teachers": int(teachers_df["Transfer_Recommended"].count()),
-        "transfer_pending": int(teachers_df["Transfer_Recommended"].sum()),
+        "schools": schools_list,
+        "teachers": teachers_list,
     }
 
 
-@app.get("/model_info")
-def model_info():
-    if os.path.exists("models/metrics.json"):
-        with open("models/metrics.json") as f:
+@app.get("/meo/{meo_id}/schools")
+def meo_schools(meo_id: str):
+    conn = get_db()
+    meo = conn.execute("SELECT * FROM meos WHERE meo_id = ?", (meo_id,)).fetchone()
+    if not meo:
+        conn.close()
+        raise HTTPException(status_code=404, detail="MEO not found")
+
+    schools = conn.execute(
+        "SELECT * FROM schools WHERE mandal = ?", (meo["assigned_mandal"],)
+    ).fetchall()
+    conn.close()
+    return [dict(s) for s in schools]
+
+
+@app.post("/approve_transfer")
+def approve_transfer(req: ApproveTransferRequest):
+    conn = get_db()
+    request = conn.execute(
+        "SELECT * FROM transfer_requests WHERE request_id = ?", (req.request_id,)
+    ).fetchone()
+    if not request:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Transfer request not found")
+
+    if request["status"] != "Pending":
+        conn.close()
+        raise HTTPException(status_code=400, detail="Request is not pending")
+
+    meo = conn.execute("SELECT * FROM meos WHERE meo_id = ?", (req.meo_id,)).fetchone()
+    if not meo:
+        conn.close()
+        raise HTTPException(status_code=404, detail="MEO not found")
+
+    if meo["assigned_mandal"] != request["mandal"]:
+        conn.close()
+        raise HTTPException(status_code=403, detail="Not authorized for this mandal")
+
+    now = datetime.now().strftime("%Y-%m-%d")
+    teacher_id = request["teacher_id"]
+    old_school = request["current_school"]
+    new_school = request["requested_school"]
+
+    # Update request status
+    conn.execute(
+        "UPDATE transfer_requests SET status = 'Approved', approval_date = ? WHERE request_id = ?",
+        (now, req.request_id)
+    )
+
+    # Update teacher record
+    conn.execute(
+        """UPDATE teachers SET current_school = ?, transfer_status = 'Approved',
+           requested_school = NULL, transfer_request = 0 WHERE teacher_id = ?""",
+        (new_school, teacher_id)
+    )
+
+    # Update old school count
+    conn.execute(
+        """UPDATE schools SET current_teacher_count = MAX(0, current_teacher_count - 1)
+           WHERE school_id = ?""",
+        (old_school,)
+    )
+
+    # Update new school count
+    conn.execute(
+        "UPDATE schools SET current_teacher_count = current_teacher_count + 1 WHERE school_id = ?",
+        (new_school,)
+    )
+
+    # Recalculate ratios
+    for sid in [old_school, new_school]:
+        s = conn.execute("SELECT * FROM schools WHERE school_id = ?", (sid,)).fetchone()
+        if s:
+            ratio = round(s["student_strength"] / max(s["current_teacher_count"], 1), 2)
+            conn.execute(
+                "UPDATE schools SET student_teacher_ratio = ? WHERE school_id = ?",
+                (ratio, sid)
+            )
+
+    conn.commit()
+    conn.close()
+
+    pdf_path = generate_transfer_pdf(req.request_id)
+
+    add_notification(
+        teacher_id,
+        f"Your transfer request ({req.request_id}) has been APPROVED. Transfer order is ready for download.",
+        "success"
+    )
+
+    return {
+        "success": True,
+        "message": "Transfer approved successfully",
+        "pdf_path": pdf_path
+    }
+
+
+@app.post("/reject_transfer")
+def reject_transfer(req: RejectTransferRequest):
+    conn = get_db()
+    request = conn.execute(
+        "SELECT * FROM transfer_requests WHERE request_id = ?", (req.request_id,)
+    ).fetchone()
+    if not request:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Transfer request not found")
+
+    if request["status"] != "Pending":
+        conn.close()
+        raise HTTPException(status_code=400, detail="Request is not pending")
+
+    meo = conn.execute("SELECT * FROM meos WHERE meo_id = ?", (req.meo_id,)).fetchone()
+    if not meo:
+        conn.close()
+        raise HTTPException(status_code=404, detail="MEO not found")
+
+    if meo["assigned_mandal"] != request["mandal"]:
+        conn.close()
+        raise HTTPException(status_code=403, detail="Not authorized for this mandal")
+
+    now = datetime.now().strftime("%Y-%m-%d")
+    conn.execute(
+        """UPDATE transfer_requests SET status = 'Rejected', approval_date = ?,
+           rejection_reason = ? WHERE request_id = ?""",
+        (now, req.rejection_reason, req.request_id)
+    )
+
+    conn.execute(
+        "UPDATE teachers SET transfer_status = 'Rejected', requested_school = NULL WHERE teacher_id = ?",
+        (request["teacher_id"],)
+    )
+    conn.commit()
+    conn.close()
+
+    add_notification(
+        request["teacher_id"],
+        f"Your transfer request ({req.request_id}) has been REJECTED. Reason: {req.rejection_reason}",
+        "error"
+    )
+
+    return {"success": True, "message": "Transfer rejected"}
+
+
+# ── Dashboard Stats ──────────────────────────────────────────────────────────
+
+@app.get("/dashboard_stats")
+def dashboard_stats():
+    conn = get_db()
+    teachers = conn.execute("SELECT * FROM teachers").fetchall()
+    schools = conn.execute("SELECT * FROM schools").fetchall()
+    requests = conn.execute("SELECT * FROM transfer_requests").fetchall()
+    conn.close()
+
+    total_teachers = len(teachers)
+    total_schools = len(schools)
+    pending_requests = sum(1 for r in requests if r["status"] == "Pending")
+    approved_requests = sum(1 for r in requests if r["status"] == "Approved")
+    rejected_requests = sum(1 for r in requests if r["status"] == "Rejected")
+
+    shortage = sum(1 for s in schools if s["current_teacher_count"] < s["required_teacher_count"])
+    surplus = sum(1 for s in schools if s["current_teacher_count"] > s["required_teacher_count"])
+    avg_ratio = round(sum(s["student_teacher_ratio"] for s in schools) / max(len(schools), 1), 2)
+
+    subject_dist = {}
+    for t in teachers:
+        subject_dist[t["subject"]] = subject_dist.get(t["subject"], 0) + 1
+
+    mandal_dist = {}
+    for t in teachers:
+        mandal_dist[t["mandal"]] = mandal_dist.get(t["mandal"], 0) + 1
+
+    metrics = {}
+    metrics_path = os.path.join(MODEL_DIR, "metrics.json")
+    if os.path.exists(metrics_path):
+        with open(metrics_path) as f:
             metrics = json.load(f)
-        return metrics
-    return {"error": "Model not trained yet"}
+
+    return {
+        "total_teachers": total_teachers,
+        "total_schools": total_schools,
+        "pending_requests": pending_requests,
+        "approved_requests": approved_requests,
+        "rejected_requests": rejected_requests,
+        "shortage_schools": shortage,
+        "surplus_schools": surplus,
+        "avg_student_teacher_ratio": avg_ratio,
+        "subject_distribution": subject_dist,
+        "mandal_distribution": mandal_dist,
+        "model_accuracy": metrics.get("accuracy", 0),
+    }
 
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+@app.get("/download_transfer_pdf/{request_id}")
+def download_pdf(request_id: str):
+    conn = get_db()
+    req = conn.execute(
+        "SELECT * FROM transfer_requests WHERE request_id = ?", (request_id,)
+    ).fetchone()
+    conn.close()
+
+    if not req:
+        raise HTTPException(status_code=404, detail="Request not found")
+    if req["status"] != "Approved":
+        raise HTTPException(status_code=400, detail="Transfer not yet approved")
+
+    pdf_path = req["generated_pdf_path"]
+    if not pdf_path or not os.path.exists(pdf_path):
+        pdf_path = generate_transfer_pdf(request_id)
+
+    if not pdf_path or not os.path.exists(pdf_path):
+        raise HTTPException(status_code=404, detail="PDF not found")
+
+    return FileResponse(
+        pdf_path,
+        media_type="text/plain",
+        filename=f"transfer_order_{request_id}.txt"
+    )
+
+
+@app.get("/schools")
+def list_schools(mandal: Optional[str] = None):
+    conn = get_db()
+    if mandal:
+        schools = conn.execute("SELECT * FROM schools WHERE mandal = ?", (mandal,)).fetchall()
+    else:
+        schools = conn.execute("SELECT * FROM schools").fetchall()
+    conn.close()
+    return [dict(s) for s in schools]
+
+
+@app.get("/workforce_stats")
+def workforce_stats():
+    conn = get_db()
+    schools = conn.execute("SELECT * FROM schools").fetchall()
+    teachers = conn.execute("SELECT * FROM teachers").fetchall()
+    conn.close()
+
+    schools_list = [dict(s) for s in schools]
+    teachers_list = [dict(t) for t in teachers]
+
+    mandal_stats = {}
+    for s in schools_list:
+        m = s["mandal"]
+        if m not in mandal_stats:
+            mandal_stats[m] = {
+                "mandal": m, "district": s["district"],
+                "schools": 0, "teachers": 0, "required": 0,
+                "shortage": 0, "surplus": 0
+            }
+        mandal_stats[m]["schools"] += 1
+        mandal_stats[m]["teachers"] += s["current_teacher_count"]
+        mandal_stats[m]["required"] += s["required_teacher_count"]
+        diff = s["current_teacher_count"] - s["required_teacher_count"]
+        if diff < 0:
+            mandal_stats[m]["shortage"] += 1
+        elif diff > 0:
+            mandal_stats[m]["surplus"] += 1
+
+    for m in mandal_stats:
+        mandal_stats[m]["gap"] = mandal_stats[m]["required"] - mandal_stats[m]["teachers"]
+
+    top_shortage = sorted(schools_list, key=lambda s: s["current_teacher_count"] - s["required_teacher_count"])[:10]
+    top_surplus = sorted(schools_list, key=lambda s: s["current_teacher_count"] - s["required_teacher_count"], reverse=True)[:10]
+
+    return {
+        "mandal_stats": list(mandal_stats.values()),
+        "top_shortage_schools": top_shortage,
+        "top_surplus_schools": top_surplus,
+        "total_teachers": len(teachers_list),
+        "total_schools": len(schools_list),
+    }
+
+
+@app.get("/test_credentials")
+def test_credentials():
+    """Returns sample credentials for testing/demo purposes"""
+    conn = get_db()
+    teachers = conn.execute("SELECT teacher_id FROM teachers LIMIT 5").fetchall()
+    meos = conn.execute("SELECT meo_id, assigned_mandal FROM meos LIMIT 5").fetchall()
+    conn.close()
+
+    return {
+        "teachers": [
+            {"id": t["teacher_id"], "password": f"tch{t['teacher_id'][3:]}", "role": "teacher"}
+            for t in teachers
+        ],
+        "meos": [
+            {"id": m["meo_id"], "password": f"meo{m['meo_id'][3:]}", "role": "meo",
+             "mandal": m["assigned_mandal"]}
+            for m in meos
+        ]
+    }

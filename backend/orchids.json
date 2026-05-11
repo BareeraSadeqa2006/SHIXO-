@@ -1,8 +1,0 @@
-{
-  "startupCommands": [
-    "cd /home/user/app/backend && pip install -r requirements.txt -q && python -m uvicorn main:app --host 0.0.0.0 --port 8000",
-    "cd /home/user/app/frontend && npm install && npm run dev"
-  ],
-  "projectId": "78750ba0-16cc-467a-8467-029ba9e62e32",
-  "templateId": "any"
-}

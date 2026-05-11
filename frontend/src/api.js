@@ -1,17 +1,25 @@
 import axios from 'axios';
 
-const BASE = 'https://shixo.onrender.com';
+const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
-export const getDashboardStats = () => axios.get(`${BASE}/dashboard_stats`).then(r => r.data);
-export const getTeachers = (search = '', page = 1, limit = 20) =>
-  axios.get(`${BASE}/teachers`, { params: { search, page, limit } }).then(r => r.data);
-export const getSchools = (search = '', page = 1, limit = 20) =>
-  axios.get(`${BASE}/schools`, { params: { search, page, limit } }).then(r => r.data);
-export const predictTransfer = (teacher_id) =>
-  axios.post(`${BASE}/predict_transfer`, { teacher_id }).then(r => r.data);
-export const recommendSchool = (teacher_id) =>
-  axios.post(`${BASE}/recommend_school`, { teacher_id }).then(r => r.data);
-export const executeTransfer = (teacher_id, target_school_id) =>
-  axios.post(`${BASE}/execute_transfer`, { teacher_id, target_school_id }).then(r => r.data);
-export const getWorkforceData = () => axios.get(`${BASE}/workforce_data`).then(r => r.data);
-export const getModelInfo = () => axios.get(`${BASE}/model_info`).then(r => r.data);
+const api = axios.create({ baseURL: API_BASE });
+
+export const login = (data) => api.post('/login', data);
+export const getTeacherProfile = (id) => api.get(`/teacher/${id}`);
+export const predictTransfer = (teacher_id) => api.post('/predict_transfer', { teacher_id });
+export const recommendSchool = (teacher_id) => api.post('/recommend_school', { teacher_id });
+export const applyTransfer = (data) => api.post('/apply_transfer', data);
+export const getTransferHistory = (id) => api.get(`/transfer_history/${id}`);
+export const getNotifications = (id) => api.get(`/notifications/${id}`);
+export const markNotificationRead = (id) => api.put(`/notifications/${id}/read`);
+export const getMeoDashboard = (id) => api.get(`/meo/${id}/dashboard`);
+export const getMeoSchools = (id) => api.get(`/meo/${id}/schools`);
+export const approveTransfer = (data) => api.post('/approve_transfer', data);
+export const rejectTransfer = (data) => api.post('/reject_transfer', data);
+export const getDashboardStats = () => api.get('/dashboard_stats');
+export const getWorkforceStats = () => api.get('/workforce_stats');
+export const getSchools = (mandal) => api.get('/schools', { params: mandal ? { mandal } : {} });
+export const downloadPdf = (request_id) => api.get(`/download_transfer_pdf/${request_id}`, { responseType: 'blob' });
+export const getTestCredentials = () => api.get('/test_credentials');
+
+export default api;
